@@ -3,13 +3,21 @@ import os from 'node:os'
 
 const DEFAULT_CLIENT_ID = 'kafka-producer'
 
-export interface KafkaProducerConfig {
+export type SASLConfig = {
+  mechanism: 'plain'
+  username: string
+  password: string
+}
+
+export type KafkaProducerConfig = {
   bootstrapServers: string[]
   clientId?: string
   compression?: CompressionTypes
   idempotent?: boolean
   retries?: number
   maxMessageBytes?: number
+  ssl?: boolean
+  sasl?: SASLConfig
 }
 
 export class KafkaProducer {
@@ -29,11 +37,26 @@ export class KafkaProducer {
       }
     }
 
-    const { bootstrapServers, clientId } = config
-    const kafka = new Kafka({
+    const { bootstrapServers, clientId, ssl, sasl } = config
+
+    const kafkaConfig: any = {
       brokers: bootstrapServers,
       clientId,
-    })
+    }
+
+    if (ssl) {
+      kafkaConfig.ssl = true
+    }
+
+    if (sasl) {
+      kafkaConfig.sasl = {
+        mechanism: sasl.mechanism,
+        username: sasl.username,
+        password: sasl.password,
+      }
+    }
+
+    const kafka = new Kafka(kafkaConfig)
 
     this.producer = kafka.producer({
       idempotent: config.idempotent ?? true,
