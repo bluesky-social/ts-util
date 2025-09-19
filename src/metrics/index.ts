@@ -2,7 +2,7 @@ import { once } from 'events'
 import express, { Application } from 'express'
 import * as prometheus from 'prom-client'
 
-type MetricConfig =
+export type MetricConfig =
   | {
       type: 'counter'
       name: string
@@ -30,7 +30,7 @@ type MetricConfig =
       percentiles?: number[]
     }
 
-type MetricInstance =
+export type MetricInstance =
   | prometheus.Counter
   | prometheus.Histogram
   | prometheus.Gauge
