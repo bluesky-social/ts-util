@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package examples;
+
+message UserEvent {
+  string user_id = 1;
+  string event_type = 2;
+  int64 timestamp = 3;
+  map<string, string> properties = 4;
+}
+
+message ProductUpdate {
+  string product_id = 1;
+  string name = 2;
+  double price = 3;
+  int32 inventory = 4;
+  string category = 5;
+  int64 updated_at = 6;
+}
+
+message LogEntry {
+  string level = 1;
+  string message = 2;
+  string service = 3;
+  int64 timestamp = 4;
+  map<string, string> metadata = 5;
+}

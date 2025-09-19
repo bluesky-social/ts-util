@@ -1,0 +1,19 @@
+{
+  "name": "kafka-producer-examples",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Examples for using the Kafka producer",
+  "scripts": {
+    "build": "tsc",
+    "basic": "ts-node basic-producer.ts",
+    "protobuf": "ts-node protobuf-producer.ts"
+  },
+  "dependencies": {
+    "protobufjs": "^7.4.0",
+    "ts-node": "^10.9.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.8.0",
+    "typescript": "^5.9.2"
+  }
+}
