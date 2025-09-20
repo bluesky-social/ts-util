@@ -11,6 +11,7 @@ export type SASLConfig = {
 
 export type KafkaProducerConfig = {
   bootstrapServers: string[]
+  topic: string
   clientId?: string
   compression?: CompressionTypes
   idempotent?: boolean
@@ -22,10 +23,12 @@ export type KafkaProducerConfig = {
 
 export class KafkaProducer {
   private producer: Producer
+  private topic: string
   private connected = false
   private maxMessageBytes: number
 
   constructor(config: KafkaProducerConfig) {
+    this.topic = config.topic
     this.maxMessageBytes = config.maxMessageBytes || 1_000_000
 
     if (!config.clientId) {
@@ -80,11 +83,7 @@ export class KafkaProducer {
     }
   }
 
-  async send(
-    topic: string,
-    value: Buffer | Uint8Array,
-    key?: string
-  ): Promise<void> {
+  async send(value: Buffer | Uint8Array, key?: string): Promise<void> {
     if (!this.connected) {
       throw new Error('Not connected. Call connect() first.')
     }
@@ -98,13 +97,12 @@ export class KafkaProducer {
     }
 
     await this.producer.send({
-      topic,
+      topic: this.topic,
       messages: [{ key, value: buffer }],
     })
   }
 
   async sendBatch(
-    topic: string,
     messages: Array<{ value: Buffer | Uint8Array; key?: string }>
   ): Promise<void> {
     if (!this.connected) {
@@ -129,7 +127,7 @@ export class KafkaProducer {
     })
 
     await this.producer.send({
-      topic,
+      topic: this.topic,
       messages: kafkaMessages,
     })
   }
