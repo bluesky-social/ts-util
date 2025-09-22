@@ -6,15 +6,14 @@
 const producer = new KafkaProducer({
   brokers: ['localhost:9092'],
   clientId: 'client-id',
+  topic: 'topic-name',
 })
 
 await producer.connect()
 
-const encoded = EventProtobuf.encode({
-  val: 'value',
-}).finish()
+const evt = new EventProtobuf({})
 
-await producer.send('events', encoded, 'some-key')
+await producer.send('events', evt.toBinary(), 'some-key')
 
 await producer.disconnect()
 ```
