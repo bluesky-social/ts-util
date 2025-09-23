@@ -1,6 +1,19 @@
 import { once } from 'events'
 import express, { Application } from 'express'
 import * as prometheus from 'prom-client'
+import promBundle from 'express-prom-bundle'
+
+const DEFAULT_PROM_BUNDLE_OPTS = {
+  includeMethod: true,
+  includePath: true,
+  includeStatusCode: true,
+  includeUp: true,
+  promClient: {
+    collectDefaultMetrics: {},
+  },
+  // Don't expose /metrics on main app - we'll use separate server
+  autoregister: false,
+}
 
 export type MetricConfig =
   | {
@@ -83,6 +96,15 @@ export class Metrics<
     ][]) {
       this.metrics[key] = this.createMetric(config, options?.prefix)
     }
+  }
+
+  registerExpressMetrics(app: Application, customOpts?: promBundle.Opts) {
+    const opts = {
+      ...DEFAULT_PROM_BUNDLE_OPTS,
+      ...customOpts,
+    }
+    const middleware = promBundle(opts)
+    app.use(middleware)
   }
 
   private createMetric(config: MetricConfig, prefix?: string): MetricInstance {
