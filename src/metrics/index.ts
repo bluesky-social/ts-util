@@ -13,6 +13,15 @@ const DEFAULT_PROM_BUNDLE_OPTS = {
   },
   // Don't expose /metrics on main app - we'll use separate server
   autoregister: false,
+  normalizePath: (req: express.Request) => {
+    // If we have a matched route, use its path (with :params) instead of the full URL path
+    if (req.route) {
+      return req.route.path
+    }
+
+    // Group all unmatched paths together to reduce cardinality
+    return '<unmatched>'
+  },
 }
 
 export type MetricConfig =
