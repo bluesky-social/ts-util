@@ -107,7 +107,7 @@ export class Metrics<
     }
   }
 
-  registerExpressMetrics(app: Application, customOpts?: promBundle.Opts) {
+  registerExpressMetrics(app: Application, customOpts: promBundle.Opts = {}) {
     const opts = {
       ...DEFAULT_PROM_BUNDLE_OPTS,
       ...customOpts,
