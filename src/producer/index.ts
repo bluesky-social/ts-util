@@ -1,4 +1,10 @@
-import { Kafka, Producer, CompressionTypes, Message } from 'kafkajs'
+import {
+  Kafka,
+  Producer,
+  CompressionTypes,
+  Message,
+  KafkaJSConnectionError,
+} from 'kafkajs'
 import os from 'node:os'
 
 const DEFAULT_CLIENT_ID = 'kafka-producer'
@@ -63,16 +69,27 @@ export class KafkaProducer {
 
     this.producer = kafka.producer({
       idempotent: config.idempotent ?? true,
+      maxInFlightRequests: 5,
       retry: {
         retries: config.retries ?? 5,
+        initialRetryTime: 300,
+        maxRetryTime: 30_000,
+        multiplier: 2,
       },
+    })
+
+    this.producer.on('producer.connect', () => {
+      this.connected = true
+    })
+
+    this.producer.on('producer.disconnect', () => {
+      this.connected = false
     })
   }
 
   async connect(): Promise<void> {
     if (!this.connected) {
       await this.producer.connect()
-      this.connected = true
     }
   }
 
@@ -84,9 +101,7 @@ export class KafkaProducer {
   }
 
   async send(value: Buffer | Uint8Array, key?: string): Promise<void> {
-    if (!this.connected) {
-      throw new Error('Not connected. Call connect() first.')
-    }
+    await this.ensureConnected()
 
     const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value)
 
@@ -96,10 +111,18 @@ export class KafkaProducer {
       )
     }
 
-    await this.producer.send({
-      topic: this.topic,
-      messages: [{ key, value: buffer }],
-    })
+    try {
+      await this.producer.send({
+        topic: this.topic,
+        messages: [{ key, value: buffer }],
+      })
+    } catch (error: any) {
+      if (error instanceof KafkaJSConnectionError) {
+        this.connected = false
+        throw new Error(`Connection lost to Kafka broker: ${error.message}`)
+      }
+      throw error
+    }
   }
 
   async sendBatch(
@@ -130,5 +153,18 @@ export class KafkaProducer {
       topic: this.topic,
       messages: kafkaMessages,
     })
+  }
+
+  async ensureConnected(maxRetries = 3) {
+    for (let i = 0; i < maxRetries; i++) {
+      if (this.connected) return
+      try {
+        await this.connect()
+        return
+      } catch (error) {
+        if (i === maxRetries - 1) throw error
+        await new Promise((resolve) => setTimeout(resolve, 1000 * (i + 1)))
+      }
+    }
   }
 }
