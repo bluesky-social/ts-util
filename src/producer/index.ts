@@ -39,10 +39,11 @@ export class KafkaProducer {
 
     if (!config.clientId) {
       const hostname = os.hostname()
+      const brokerHostname = config.bootstrapServers[0].split(':')[0]
       if (hostname) {
-        config.clientId = `${hostname};host_override=${config.bootstrapServers[0]}`
+        config.clientId = `${hostname};host_override=${brokerHostname}`
       } else {
-        config.clientId = `${DEFAULT_CLIENT_ID};host_override=${config.bootstrapServers[0]}`
+        config.clientId = `${DEFAULT_CLIENT_ID};host_override=${brokerHostname}`
       }
     }
 
