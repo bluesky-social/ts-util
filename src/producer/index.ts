@@ -1,4 +1,4 @@
-import { Kafka, Producer, KafkaConfig } from 'kafkajs'
+import { Kafka, Producer, KafkaConfig, Admin } from 'kafkajs'
 import os from 'node:os'
 
 const DEFAULT_CLIENT_ID = 'kafka-producer'
@@ -10,25 +10,46 @@ export type SASLConfig = {
 }
 
 export type KafkaProducerConfig = {
+  // Kafka client
   bootstrapServers: string[]
+  clientId: string
+  requestTimeout?: number
+  ssl: boolean
+  sasl?: SASLConfig
+
+  // Producer
   topic: string
-  clientId?: string
   idempotent?: boolean
   retries?: number
   maxInFlightRequests?: number
   maxRetryTime?: number
   maxMessageBytes?: number
-  requestTimeout?: number
-  ssl?: boolean
-  sasl?: SASLConfig
+
+  // Topic
+  numPartitions?: number
+  replicationFactor?: number
+}
+
+const DEFAULT_CONFIG: Partial<KafkaProducerConfig> = {
+  requestTimeout: 30_000, // Default timeout in KafkaJS
+  idempotent: true,
+  retries: 3,
+  maxInFlightRequests: 5, // Default in KafkaJS
+  maxRetryTime: 15_000, // Lower than the KafkaJS default of 30s
+  maxMessageBytes: 1_000_000, // 1MB
+  numPartitions: 20,
+  replicationFactor: 1,
 }
 
 export class KafkaProducer {
+  private config: KafkaProducerConfig
   private producer: Producer
   private topic: string
   private maxMessageBytes: number
+  private admin: Admin
 
   private constructor(config: KafkaProducerConfig) {
+    this.config = config
     this.topic = config.topic
     this.maxMessageBytes = config.maxMessageBytes || 1_000_000
 
@@ -47,7 +68,7 @@ export class KafkaProducer {
     const kafkaConfig: KafkaConfig = {
       brokers: bootstrapServers,
       clientId,
-      requestTimeout: config.requestTimeout ?? 30_000,
+      requestTimeout: config.requestTimeout,
     }
 
     if (ssl) {
@@ -65,20 +86,28 @@ export class KafkaProducer {
     const kafka = new Kafka(kafkaConfig)
 
     this.producer = kafka.producer({
-      idempotent: config.idempotent ?? true,
-      maxInFlightRequests: config.maxInFlightRequests ?? 5,
+      idempotent: config.idempotent,
+      maxInFlightRequests: config.maxInFlightRequests,
       retry: {
-        retries: config.retries ?? 5,
+        retries: config.retries,
         initialRetryTime: 300,
-        maxRetryTime: config.maxRetryTime ?? 30_000,
+        maxRetryTime: config.maxRetryTime,
         multiplier: 2,
       },
     })
+
+    this.admin = kafka.admin()
   }
 
   static async create(config: KafkaProducerConfig): Promise<KafkaProducer> {
-    const producer = new KafkaProducer(config)
+    const fullConfig = {
+      ...DEFAULT_CONFIG,
+      ...config,
+    }
+
+    const producer = new KafkaProducer(fullConfig)
     await producer.connect()
+    await producer.ensureTopicExists()
     return producer
   }
 
@@ -88,6 +117,22 @@ export class KafkaProducer {
 
   async disconnect(): Promise<void> {
     await this.producer.disconnect()
+  }
+
+  private async ensureTopicExists(): Promise<void> {
+    const topics = await this.admin.listTopics()
+
+    if (!topics.includes(this.topic)) {
+      await this.admin.createTopics({
+        topics: [
+          {
+            topic: this.config.topic,
+            numPartitions: this.config.numPartitions,
+            replicationFactor: this.config.replicationFactor,
+          },
+        ],
+      })
+    }
   }
 
   async send(value: Buffer | Uint8Array, key?: string): Promise<void> {
