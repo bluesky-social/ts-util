@@ -30,16 +30,27 @@ export type KafkaProducerConfig = {
   sasl?: SASLConfig
 }
 
-export type KafkaProducerMessage = {
+type KafkaProducerMessage = {
   value: Buffer | Uint8Array
   key?: string
 }
 
 export type KafkaBatchingConfig = {
+  // Maximum records per batch.
   maxBatchRecords?: number
+  // Maximum bytes per batch.
   maxBatchBytes?: number
+  // Maximum time to wait before sending a partial batch.
   maxBatchWaitMs?: number
-  onError?: (error: unknown) => void
+  // Handles terminal background send failures. Failed batches are dropped.
+  onError?: (error: unknown) => void | Promise<void>
+}
+
+export class KafkaProducerClosedError extends Error {
+  constructor() {
+    super('Kafka producer is closed')
+    this.name = 'KafkaProducerClosedError'
+  }
 }
 
 export class KafkaProducer {
@@ -100,7 +111,10 @@ export class KafkaProducer {
     })
 
     if (config.batching) {
-      this.batcher = new KafkaBatcher(this, config.batching)
+      this.batcher = new KafkaBatcher(
+        (messages) => this.sendMessages(messages),
+        config.batching
+      )
     }
   }
 
@@ -115,7 +129,7 @@ export class KafkaProducer {
   }
 
   async disconnect(): Promise<void> {
-    await this.batcher?.flush()
+    await this.batcher?.drain()
     await this.producer.disconnect()
   }
 
@@ -123,25 +137,19 @@ export class KafkaProducer {
     if (!this.batcher) {
       throw new Error('Kafka producer batching is not configured')
     }
-    this.batcher.add(value, key)
+
+    this.batcher.enqueue(this.prepareValue(value), key)
   }
 
   async send(value: Buffer | Uint8Array, key?: string): Promise<void> {
-    await this.sendBatch([{ value, key }])
+    await this.sendMessages([{ value, key }])
   }
 
-  async sendBatch(messages: KafkaProducerMessage[]): Promise<void> {
-    const kafkaMessages = messages.map(({ value, key }) => {
-      const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value)
-
-      if (buffer.length > this.maxMessageBytes) {
-        throw new Error(
-          `Message size ${buffer.length} bytes exceeds max ${this.maxMessageBytes} bytes`
-        )
-      }
-
-      return { key, value: buffer }
-    })
+  private async sendMessages(messages: KafkaProducerMessage[]): Promise<void> {
+    const kafkaMessages = messages.map(({ value, key }) => ({
+      key,
+      value: this.prepareValue(value),
+    }))
 
     await this.producer.send({
       topic: this.topic,
@@ -149,9 +157,26 @@ export class KafkaProducer {
       compression: this.compression,
     })
   }
+
+  private prepareValue(value: Buffer | Uint8Array): Buffer {
+    const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value)
+    if (buffer.length > this.maxMessageBytes) {
+      throw new Error(
+        `Message size ${buffer.length} bytes exceeds max ${this.maxMessageBytes} bytes`
+      )
+    }
+    return buffer
+  }
 }
 
-export class KafkaBatcher {
+function requireInt(name: string, value: number, min: number): number {
+  if (!Number.isInteger(value) || value < min) {
+    throw new RangeError(`${name} must be an integer >= ${min}`)
+  }
+  return value
+}
+
+class KafkaBatcher {
   private readonly maxBatchRecords: number
   private readonly maxBatchBytes: number
   private readonly maxBatchWaitMs: number
@@ -159,24 +184,39 @@ export class KafkaBatcher {
   private pending: KafkaProducerMessage[] = []
   private pendingBytes = 0
   private timer?: ReturnType<typeof setTimeout>
-  private flushPromise?: Promise<void>
+  private sendPromise?: Promise<void>
   private closed = false
 
   constructor(
-    private readonly producer: KafkaProducer,
+    private readonly sendMessages: (
+      messages: KafkaProducerMessage[]
+    ) => Promise<void>,
     options: KafkaBatchingConfig = {}
   ) {
-    this.maxBatchRecords = options.maxBatchRecords ?? DEFAULT_MAX_BATCH_RECORDS
-    this.maxBatchBytes = options.maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES
-    this.maxBatchWaitMs = options.maxBatchWaitMs ?? DEFAULT_MAX_BATCH_WAIT_MS
+    this.maxBatchRecords = requireInt(
+      'maxBatchRecords',
+      options.maxBatchRecords ?? DEFAULT_MAX_BATCH_RECORDS,
+      1
+    )
+    this.maxBatchBytes = requireInt(
+      'maxBatchBytes',
+      options.maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES,
+      1
+    )
+    this.maxBatchWaitMs = requireInt(
+      'maxBatchWaitMs',
+      options.maxBatchWaitMs ?? DEFAULT_MAX_BATCH_WAIT_MS,
+      0
+    )
     this.onError = options.onError
   }
 
-  add(value: Buffer | Uint8Array, key?: string): void {
-    if (this.closed) return
+  enqueue(value: Buffer | Uint8Array, key?: string): void {
+    // Reject late writes instead of silently losing them during shutdown.
+    if (this.closed) throw new KafkaProducerClosedError()
 
     this.pending.push({ value, key })
-    this.pendingBytes += value.byteLength
+    this.pendingBytes += this.messageBytes(value, key)
     if (
       this.pending.length >= this.maxBatchRecords ||
       this.pendingBytes >= this.maxBatchBytes
@@ -187,29 +227,53 @@ export class KafkaBatcher {
     }
   }
 
-  async flush(): Promise<void> {
+  async drain(): Promise<void> {
     this.closed = true
     this.clearTimer()
-    while (this.pending.length > 0 || this.flushPromise) {
+    while (this.pending.length > 0 || this.sendPromise) {
       this.startFlush()
-      await this.flushPromise
+      await this.sendPromise
     }
   }
 
   private startFlush(): void {
-    if (this.pending.length === 0 || this.flushPromise) return
+    if (this.pending.length === 0 || this.sendPromise) return
 
     this.clearTimer()
-    const messages = this.pending
-    this.pending = []
-    this.pendingBytes = 0
-    this.flushPromise = this.producer.sendBatch(messages).catch((error) => {
-      this.onError?.(error)
+    const messages = this.takeBatch()
+    this.sendPromise = this.sendMessages(messages).catch((error) => {
+      try {
+        void Promise.resolve(this.onError?.(error)).catch(() => {})
+      } catch {
+        // Ignore callback failures.
+      }
     })
-    this.flushPromise.finally(() => {
-      this.flushPromise = undefined
+    this.sendPromise.finally(() => {
+      this.sendPromise = undefined
       if (this.pending.length > 0) this.startFlush()
     })
+  }
+
+  // Drain one batch bounded by the record and byte limits. Records that pile up
+  // during an in-flight send stay queued for the next batch, so a burst can't
+  // produce a single oversized request.
+  private takeBatch(): KafkaProducerMessage[] {
+    let count = 0
+    let bytes = 0
+    while (count < this.pending.length && count < this.maxBatchRecords) {
+      const { value, key } = this.pending[count]
+      const next = bytes + this.messageBytes(value, key)
+      // Always take at least one so a record larger than maxBatchBytes can't stall the queue.
+      if (count > 0 && next > this.maxBatchBytes) break
+      bytes = next
+      count++
+    }
+    this.pendingBytes -= bytes
+    return this.pending.splice(0, count)
+  }
+
+  private messageBytes(value: Buffer | Uint8Array, key?: string): number {
+    return value.byteLength + (key ? Buffer.byteLength(key) : 0)
   }
 
   private clearTimer(): void {

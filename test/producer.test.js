@@ -2,7 +2,7 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { KafkaProducer } = require('../lib/producer')
+const { KafkaProducer, KafkaProducerClosedError } = require('../lib/producer')
 
 function deferred() {
   let resolve
@@ -12,115 +12,113 @@ function deferred() {
   return { promise, resolve }
 }
 
-function createProducer(options) {
-  const producer = Object.create(KafkaProducer.prototype)
-  producer.topic = 'events'
-  producer.maxMessageBytes = 1_000_000
-  producer.producer = options.producer
-  producer.batcher = options.batching
-    ? new (require('../lib/producer').KafkaBatcher)(producer, options.batching)
-    : undefined
-  return producer
+function createProducer(config, send, disconnect = async () => {}) {
+  const { Kafka } = require('kafkajs')
+  const original = Kafka.prototype.producer
+  Kafka.prototype.producer = () => ({
+    connect: async () => {},
+    send,
+    disconnect,
+  })
+  try {
+    return KafkaProducer.create({
+      bootstrapServers: ['localhost:9092'],
+      topic: 'events',
+      ...config,
+    })
+  } finally {
+    Kafka.prototype.producer = original
+  }
 }
 
-test('KafkaProducer batches enqueued records and drains on disconnect', async () => {
+test('batches records and drains bounded batches on disconnect', async () => {
   const firstSend = deferred()
   const calls = []
-  let sendCount = 0
-  let disconnectCount = 0
-  const producer = createProducer({
-    batching: { maxBatchRecords: 2, maxBatchWaitMs: 1_000 },
-    producer: {
-      send: ({ messages }) => {
-        calls.push(messages)
-        sendCount += 1
-        return sendCount === 1 ? firstSend.promise : Promise.resolve()
-      },
-      disconnect: async () => {
-        disconnectCount += 1
-      },
-    },
-  })
+  const producer = await createProducer(
+    { batching: { maxBatchRecords: 2, maxBatchWaitMs: 1_000 } },
+    ({ messages }) => {
+      calls.push(messages)
+      return calls.length === 1 ? firstSend.promise : Promise.resolve()
+    }
+  )
 
-  producer.enqueue(Buffer.from('one'), 'first')
-  producer.enqueue(Buffer.from('two'), 'second')
-  producer.enqueue(Buffer.from('three'), 'third')
-
-  assert.deepEqual(calls[0], [
-    { value: Buffer.from('one'), key: 'first' },
-    { value: Buffer.from('two'), key: 'second' },
-  ])
-
+  for (const value of ['a', 'b', 'c', 'd', 'e']) {
+    producer.enqueue(Buffer.from(value), value)
+  }
   firstSend.resolve()
   await producer.disconnect()
 
-  assert.deepEqual(calls[1], [
-    { value: Buffer.from('three'), key: 'third' },
-  ])
-  assert.equal(disconnectCount, 1)
-})
-
-test('KafkaProducer flushes batches at the byte threshold', async () => {
-  const sent = deferred()
-  const calls = []
-  const producer = createProducer({
-    batching: {
-      maxBatchRecords: 100,
-      maxBatchBytes: 6,
-      maxBatchWaitMs: 1_000,
-    },
-    producer: {
-      send: async ({ messages }) => {
-        calls.push(messages)
-        sent.resolve()
-      },
-      disconnect: async () => {},
-    },
-  })
-
-  producer.enqueue(Buffer.from('one'), 'first')
-  producer.enqueue(Buffer.from('two'), 'second')
-  await sent.promise
-
-  assert.deepEqual(calls, [
-    [
-      { value: Buffer.from('one'), key: 'first' },
-      { value: Buffer.from('two'), key: 'second' },
-    ],
-  ])
-  await producer.disconnect()
-})
-
-test('KafkaProducer flushes partial batches after the wait time', async () => {
-  const sent = deferred()
-  const calls = []
-  const producer = createProducer({
-    batching: { maxBatchRecords: 100, maxBatchWaitMs: 10 },
-    producer: {
-      send: async ({ messages }) => {
-        calls.push(messages)
-        sent.resolve()
-      },
-      disconnect: async () => {},
-    },
-  })
-
-  producer.enqueue(Buffer.from('one'), 'first')
-  await sent.promise
-
-  assert.deepEqual(calls, [
-    [{ value: Buffer.from('one'), key: 'first' }],
-  ])
-  await producer.disconnect()
-})
-
-test('KafkaProducer requires batching for enqueue', () => {
-  const producer = createProducer({
-    producer: { disconnect: async () => {} },
-  })
-
-  assert.throws(
-    () => producer.enqueue(Buffer.from('one')),
-    /batching is not configured/
+  assert.ok(calls.every((messages) => messages.length <= 2))
+  assert.deepEqual(
+    calls.flat().map(({ key }) => key),
+    ['a', 'b', 'c', 'd', 'e']
   )
+})
+
+test('flushes when the byte threshold is reached', async () => {
+  const sent = deferred()
+  const calls = []
+  const producer = await createProducer(
+    {
+      batching: {
+        maxBatchRecords: 100,
+        maxBatchBytes: 8,
+        maxBatchWaitMs: 1_000,
+      },
+    },
+    async ({ messages }) => {
+      calls.push(messages)
+      sent.resolve()
+    }
+  )
+
+  producer.enqueue(Buffer.from('one'), 'first')
+  await sent.promise
+
+  assert.deepEqual(calls[0], [
+    { value: Buffer.from('one'), key: 'first' },
+  ])
+  await producer.disconnect()
+})
+
+test('rejects enqueue after disconnect starts', async () => {
+  const send = deferred()
+  const producer = await createProducer(
+    { batching: { maxBatchRecords: 1 } },
+    () => send.promise
+  )
+
+  producer.enqueue(Buffer.from('one'))
+  const disconnect = producer.disconnect()
+  assert.throws(
+    () => producer.enqueue(Buffer.from('two')),
+    KafkaProducerClosedError
+  )
+  send.resolve()
+  await disconnect
+})
+
+test('continues after send and error handler failures', async () => {
+  let calls = 0
+  const producer = await createProducer(
+    {
+      batching: {
+        maxBatchRecords: 1,
+        onError: async () => {
+          throw new Error('handler failed')
+        },
+      },
+    },
+    async () => {
+      calls += 1
+      if (calls === 1) throw new Error('send failed')
+    }
+  )
+
+  producer.enqueue(Buffer.from('one'))
+  await new Promise((resolve) => setImmediate(resolve))
+  producer.enqueue(Buffer.from('two'))
+  await producer.disconnect()
+
+  assert.equal(calls, 2)
 })
