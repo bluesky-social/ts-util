@@ -40,10 +40,21 @@ export type KafkaBatchingConfig = {
   maxBatchRecords?: number
   // Maximum bytes per batch.
   maxBatchBytes?: number
-  // Maximum time to wait before sending a partial batch.
+  // Maximum time to wait before starting a partial batch when idle.
   maxBatchWaitMs?: number
+  // Maximum records buffered across pending and in-flight batches.
+  maxBufferedRecords?: number
+  // Maximum bytes buffered across pending and in-flight batches.
+  maxBufferedBytes?: number
   // Handles terminal background send failures. Failed batches are dropped.
   onError?: (error: unknown) => void | Promise<void>
+}
+
+export class KafkaProducerQueueFullError extends Error {
+  constructor() {
+    super('Kafka producer queue is full')
+    this.name = 'KafkaProducerQueueFullError'
+  }
 }
 
 export class KafkaProducerClosedError extends Error {
@@ -133,6 +144,7 @@ export class KafkaProducer {
     await this.producer.disconnect()
   }
 
+  // The value must not be modified or reused after enqueueing.
   enqueue(value: Buffer | Uint8Array, key?: string): void {
     if (!this.batcher) {
       throw new Error('Kafka producer batching is not configured')
@@ -180,9 +192,13 @@ class KafkaBatcher {
   private readonly maxBatchRecords: number
   private readonly maxBatchBytes: number
   private readonly maxBatchWaitMs: number
+  private readonly maxBufferedRecords: number
+  private readonly maxBufferedBytes: number
   private readonly onError?: (error: unknown) => void
   private pending: KafkaProducerMessage[] = []
   private pendingBytes = 0
+  private inFlightRecords = 0
+  private inFlightBytes = 0
   private timer?: ReturnType<typeof setTimeout>
   private sendPromise?: Promise<void>
   private closed = false
@@ -208,6 +224,16 @@ class KafkaBatcher {
       options.maxBatchWaitMs ?? DEFAULT_MAX_BATCH_WAIT_MS,
       0
     )
+    this.maxBufferedRecords = requireInt(
+      'maxBufferedRecords',
+      options.maxBufferedRecords ?? Number.MAX_SAFE_INTEGER,
+      1
+    )
+    this.maxBufferedBytes = requireInt(
+      'maxBufferedBytes',
+      options.maxBufferedBytes ?? Number.MAX_SAFE_INTEGER,
+      1
+    )
     this.onError = options.onError
   }
 
@@ -215,8 +241,16 @@ class KafkaBatcher {
     // Reject late writes instead of silently losing them during shutdown.
     if (this.closed) throw new KafkaProducerClosedError()
 
+    const bytes = this.messageBytes(value, key)
+    if (
+      this.pending.length + this.inFlightRecords >= this.maxBufferedRecords ||
+      this.pendingBytes + this.inFlightBytes + bytes > this.maxBufferedBytes
+    ) {
+      throw new KafkaProducerQueueFullError()
+    }
+
     this.pending.push({ value, key })
-    this.pendingBytes += this.messageBytes(value, key)
+    this.pendingBytes += bytes
     if (
       this.pending.length >= this.maxBatchRecords ||
       this.pendingBytes >= this.maxBatchBytes
@@ -241,6 +275,11 @@ class KafkaBatcher {
 
     this.clearTimer()
     const messages = this.takeBatch()
+    this.inFlightRecords = messages.length
+    this.inFlightBytes = messages.reduce(
+      (bytes, { value, key }) => bytes + this.messageBytes(value, key),
+      0
+    )
     this.sendPromise = this.sendMessages(messages).catch((error) => {
       try {
         void Promise.resolve(this.onError?.(error)).catch(() => {})
@@ -250,6 +289,8 @@ class KafkaBatcher {
     })
     this.sendPromise.finally(() => {
       this.sendPromise = undefined
+      this.inFlightRecords = 0
+      this.inFlightBytes = 0
       if (this.pending.length > 0) this.startFlush()
     })
   }

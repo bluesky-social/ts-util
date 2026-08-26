@@ -2,7 +2,11 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { KafkaProducer, KafkaProducerClosedError } = require('../lib/producer')
+const {
+  KafkaProducer,
+  KafkaProducerClosedError,
+  KafkaProducerQueueFullError,
+} = require('../lib/producer')
 
 function deferred() {
   let resolve
@@ -78,6 +82,29 @@ test('flushes when the byte threshold is reached', async () => {
   assert.deepEqual(calls[0], [
     { value: Buffer.from('one'), key: 'first' },
   ])
+  await producer.disconnect()
+})
+
+test('rejects enqueue when the buffer is full', async () => {
+  const send = deferred()
+  const producer = await createProducer(
+    {
+      batching: {
+        maxBatchRecords: 1,
+        maxBufferedRecords: 2,
+        maxBufferedBytes: 10,
+      },
+    },
+    () => send.promise
+  )
+
+  producer.enqueue(Buffer.from('one'))
+  producer.enqueue(Buffer.from('two'))
+  assert.throws(
+    () => producer.enqueue(Buffer.from('three')),
+    KafkaProducerQueueFullError
+  )
+  send.resolve()
   await producer.disconnect()
 })
 
